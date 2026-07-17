@@ -54,8 +54,8 @@
   .card{background:var(--card); border:1px solid var(--border); border-radius:12px;
     overflow:hidden;}
   .list-head, .row{
-    display:grid; grid-template-columns:1fr 120px 90px; gap:14px; align-items:center;
-    padding:12px 16px;
+    display:grid; grid-template-columns:32px 1fr 100px 70px; gap:10px; align-items:center;
+    padding:10px 16px;
   }
   .list-head{
     font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em;
@@ -70,7 +70,11 @@
   .bar-wrap{margin-top:6px; height:8px; background:#eef0f3; border-radius:6px; overflow:hidden;}
   .bar{height:100%; border-radius:6px; transition:width .5s cubic-bezier(.2,.8,.2,1);}
   .size{font-variant-numeric:tabular-nums; font-weight:600; text-align:right; font-size:14px;}
-  .size .sub{display:block; font-weight:400; font-size:11px; color:var(--muted);}
+  .cb{display:flex; align-items:center; justify-content:center;}
+  .cb input[type=checkbox]{width:16px; height:16px; cursor:pointer; accent-color:var(--accent);}
+  .sel-bar{display:flex; align-items:center; gap:12px; padding:8px 16px; background:var(--accent-soft);
+    border-bottom:1px solid var(--border); font-size:13px;}
+  .sel-bar .count b{color:var(--accent);}
   .del{justify-self:end;}
   .del button{padding:6px 12px; font-size:13px; color:var(--danger); border-color:#f0d0d0;}
   .del button:hover{background:var(--danger-soft); border-color:var(--danger);}
@@ -112,9 +116,9 @@
 
   @media(max-width:640px){
     .list-head{display:none;}
-    .row{grid-template-columns:1fr 80px; gap:8px; padding:14px 14px;}
-    .del{grid-column:1 / -1; justify-self:start;}
-    .del button{width:100%;}
+    .row{grid-template-columns:32px 1fr 70px 60px; gap:6px; padding:10px 12px;}
+    .size{font-size:12px;}
+    .del button{width:100%; padding:6px 8px; font-size:12px;}
   }
 </style>
 </head>
@@ -136,9 +140,15 @@
 
   <div class="card">
     <div class="list-head">
+      <span class="cb"><input type="checkbox" id="selectAll"></span>
       <span>文件夹</span>
       <span style="text-align:right">大小</span>
       <span style="text-align:right">操作</span>
+    </div>
+    <div id="selBar" class="sel-bar" style="display:none">
+      <span class="count">已选 <b id="selCount">0</b> 个</span>
+      <button id="clearSel">取消</button>
+      <button id="delSelected" class="danger">删除选中</button>
     </div>
     <div id="body">
       <div class="loading"><div class="spinner"></div>扫描中…</div>
@@ -150,7 +160,7 @@
   </div>
 </div>
 
-<!-- 确认删除 modal -->
+<!-- 确认删除 modal（单个） -->
 <div class="modal-mask hide" id="modal">
   <div class="modal">
     <h3>⚠️ 确认删除</h3>
@@ -165,11 +175,26 @@
   </div>
 </div>
 
+<!-- 批量删除确认弹窗 -->
+<div class="modal-mask hide" id="modalBatch">
+  <div class="modal">
+    <h3>⚠️ 批量删除</h3>
+    <p>即将删除 <b id="batchCount"></b> 个文件夹：</p>
+    <p class="target" id="batchNames" style="max-height:120px;overflow-y:auto"></p>
+    <p class="warn">此操作将永久删除以上文件夹及其全部内容，不可恢复！</p>
+    <div class="actions">
+      <button onclick="closeModalBatch()">取消</button>
+      <button class="danger" id="confirmBatchDel">确认删除</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
 const $ = id => document.getElementById(id);
 let DATA = [];
+let selected = new Set();
 let pendingDelete = null;
 let viewMode = 'list'; // 'list' | 'pie'
 
@@ -178,6 +203,10 @@ function fmt(bytes){
   while(v>=1024 && i<u.length-1){v/=1024; i++;}
   const d = v<10 && i>0 ? 2 : (v<100 ? 1 : 0);
   return v.toFixed(d)+' '+u[i];
+}
+function fmtGB(bytes){
+  const gb = bytes / 1073741824;
+  return gb.toFixed(gb < 10 ? 2 : (gb < 100 ? 1 : 0)) + ' GB';
 }
 function barColor(ratio){
   if(ratio>0.66) return 'var(--bar-3)';
@@ -214,7 +243,6 @@ function drawPie(){
   const ctx = canvas.getContext('2d');
   const legend = $('legend');
 
-  // 根据容器宽度设定画布尺寸
   const containerW = wrap.clientWidth || 600;
   const dpr = window.devicePixelRatio || 1;
   const size = Math.min(containerW - 32, 600);
@@ -233,20 +261,32 @@ function drawPie(){
   }
 
   const total = DATA.reduce((s,f)=>s+f.size_bytes, 0);
-  const cx = W/2, cy = 220;   // 饼图中心
+  const cx = W/2, cy = 220;
   const radius = Math.min(cx, cy) - 60;
 
-  // 按大小排序（大的先画减少重叠），实际 DATA 已排好
-  let start = -Math.PI/2; // 从12点方向开始
+  // 按大小分成主要(>=3%)和次要(<3%)
+  const PIE_MIN = 0.03;
+  const major = DATA.filter(f => f.size_bytes / total >= PIE_MIN);
+  const other = DATA.filter(f => f.size_bytes / total < PIE_MIN);
+
+  let start = -Math.PI/2;
   const slices = [];
 
-  DATA.forEach((f,i)=>{
-    const angle = (f.size_bytes / total) * 2 * Math.PI;
-    const end = start + angle;
-    const color = PIE_COLORS[i % PIE_COLORS.length];
-    slices.push({name:f.name, size:f.size_bytes, pct:f.size_bytes/total, start, end, color});
-    start = end;
+  major.forEach((f,i)=>{
+    const pct = f.size_bytes / total;
+    const angle = pct * 2 * Math.PI;
+    slices.push({name:f.name, size:f.size_bytes, pct, start, end:start+angle, color:PIE_COLORS[i % PIE_COLORS.length]});
+    start += angle;
   });
+
+  if(other.length){
+    const otherBytes = other.reduce((s,f)=>s+f.size_bytes, 0);
+    const pct = otherBytes / total;
+    const angle = pct * 2 * Math.PI;
+    if(angle > 0.005){
+      slices.push({name:`其他(${other.length}个)`, size:otherBytes, pct, start, end:start+angle, color:'#adb5bd', isOther:true});
+    }
+  }
 
   // 画扇区
   slices.forEach(s=>{
@@ -256,38 +296,33 @@ function drawPie(){
     ctx.closePath();
     ctx.fillStyle = s.color;
     ctx.fill();
-    // 描边
     ctx.strokeStyle = '#fff';
     ctx.lineWidth = 2;
     ctx.stroke();
   });
 
-  // 画标签（从扇区中间向外拉线 + 文字）
+  // 引线 + 标签
   ctx.font = '13px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
   ctx.textBaseline = 'middle';
   const labelR = radius + 16;
 
   slices.forEach(s=>{
+    if(s.pct < PIE_MIN || s.isOther) return;
     const mid = s.start + (s.end - s.start)/2;
     const lx = cx + Math.cos(mid) * labelR;
     const ly = cy + Math.sin(mid) * labelR;
     const outerX = cx + Math.cos(mid) * (radius + 10);
     const outerY = cy + Math.sin(mid) * (radius + 10);
 
-    if(s.pct < 0.03) return; // 小于3%不画标签避免拥挤
-
-    // 引线
     ctx.beginPath();
     ctx.moveTo(cx + Math.cos(mid) * radius, cy + Math.sin(mid) * radius);
     ctx.lineTo(outerX, outerY);
-    // 横向延展
     const extendX = lx + (mid > -Math.PI/2 && mid < Math.PI/2 ? 20 : -20);
     ctx.lineTo(extendX, ly);
     ctx.strokeStyle = '#868e96';
     ctx.lineWidth = 1;
     ctx.stroke();
 
-    // 文字
     const pctStr = (s.pct*100).toFixed(1) + '%';
     const label = s.name.length > 12 ? s.name.slice(0,11)+'…' : s.name;
     ctx.fillStyle = '#1f2329';
@@ -296,9 +331,9 @@ function drawPie(){
   });
 
   // 图例
-  legend.innerHTML = slices.map((s,i)=>{
+  legend.innerHTML = slices.map(s=>{
     const pctStr = (s.pct*100).toFixed(1)+'%';
-    return `<div class="legend-item"><span class="dot" style="background:${s.color}"></span>${esc(s.name)} <span class="pct">${fmt(s.size)} (${pctStr})</span></div>`;
+    return `<div class="legend-item"><span class="dot" style="background:${s.color}"></span>${esc(s.name)} <span class="pct">${fmtGB(s.size)} (${pctStr})</span></div>`;
   }).join('');
 }
 
@@ -306,27 +341,54 @@ function render(){
   const body = $('body');
   if(!DATA.length){
     body.innerHTML = '<div class="empty"><div class="big">📂</div>没有子文件夹</div>';
+    updateSelUI();
     return;
   }
   const max = DATA[0].size_bytes || 1;
   body.innerHTML = DATA.map(f=>{
     const ratio = f.size_bytes / max;
+    const chk = selected.has(f.name) ? 'checked' : '';
     return `
     <div class="row">
+      <span class="cb"><input type="checkbox" data-name="${escAttr(f.name)}" ${chk}></span>
       <div class="name">
         <div class="nm" title="${esc(f.name)}">${esc(f.name)}</div>
         <div class="bar-wrap"><div class="bar" style="width:${(ratio*100).toFixed(1)}%;background:${barColor(ratio)}"></div></div>
       </div>
-      <div class="size">${fmt(f.size_bytes)}<span class="sub">${f.size_bytes.toLocaleString()} B</span></div>
-      <div class="del"><button onclick="askDelete('${escAttr(f.name)}')">删除</button></div>
+      <div class="size">${fmtGB(f.size_bytes)}</div>
+      <div class="del"><button onclick="askDelete('${escAttr(f.name)}')">删</button></div>
     </div>`;
   }).join('');
+  // 绑定行级 checkbox
+  body.querySelectorAll('.row input[type=checkbox]').forEach(cb=>{
+    cb.addEventListener('change', ()=>{
+      if(cb.checked) selected.add(cb.dataset.name);
+      else selected.delete(cb.dataset.name);
+      updateSelUI();
+    });
+  });
+  updateSelUI();
 }
 
 function renderSummary(meta){
   $('dirBadge').textContent = meta.dir;
-  $('summary').innerHTML = `共 <b>${meta.count}</b> 个 · 总计 <b>${fmt(meta.total_bytes)}</b>`
+  $('summary').innerHTML = `共 <b>${meta.count}</b> 个 · 总计 <b>${fmtGB(meta.total_bytes)}</b>`
     + (meta.mock ? ' · <span style="color:var(--bar-2)">模拟数据</span>' : '');
+}
+
+function updateSelUI(){
+  const bar = $('selBar');
+  const cnt = selected.size;
+  bar.style.display = cnt ? 'flex' : 'none';
+  $('selCount').textContent = cnt;
+  // 同步全选框
+  const cbs = document.querySelectorAll('#body .row input[type=checkbox]');
+  const checked = document.querySelectorAll('#body .row input[type=checkbox]:checked');
+  const all = $('selectAll');
+  if(all){
+    all.checked = cbs.length > 0 && checked.length === cbs.length;
+    all.indeterminate = checked.length > 0 && checked.length < cbs.length;
+  }
 }
 
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
@@ -405,9 +467,62 @@ $('refresh').addEventListener('click', load);
 $('viewToggle').addEventListener('click', ()=>{
   switchView(viewMode === 'list' ? 'pie' : 'list');
 });
+$('selectAll').addEventListener('change', ()=>{
+  const checked = $('selectAll').checked;
+  document.querySelectorAll('#body .row input[type=checkbox]').forEach(cb=>{
+    cb.checked = checked;
+    if(checked) selected.add(cb.dataset.name);
+    else selected.delete(cb.dataset.name);
+  });
+  updateSelUI();
+});
+$('clearSel').addEventListener('click', ()=>{
+  selected.clear();
+  document.querySelectorAll('#body .row input[type=checkbox]').forEach(cb=>{cb.checked=false});
+  updateSelUI();
+});
+$('delSelected').addEventListener('click', ()=>{
+  const names = [...selected];
+  if(!names.length) return;
+  $('batchCount').textContent = names.length;
+  $('batchNames').textContent = names.join('、');
+  $('modalBatch').classList.remove('hide');
+});
+$('confirmBatchDel').addEventListener('click', doBatchDelete);
 $('confirmDel').addEventListener('click', doDelete);
 $('modal').addEventListener('click', e=>{ if(e.target.id==='modal') closeModal(); });
-document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeModal(); });
+$('modalBatch').addEventListener('click', e=>{ if(e.target.id==='modalBatch') closeModalBatch(); });
+document.addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeModal(); closeModalBatch(); } });
+
+async function doBatchDelete(){
+  const names = [...selected];
+  if(!names.length) return;
+  const btn = $('confirmBatchDel');
+  btn.disabled = true;
+  btn.textContent = '删除中…';
+  let ok=0, fail=0;
+  for(let i=0;i<names.length;i++){
+    try{
+      const r = await fetch('/api/delete',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({name:names[i]})
+      });
+      const j = await r.json();
+      if(j.ok){ ok++; DATA = DATA.filter(x=>x.name!==names[i]); }
+      else fail++;
+    }catch(e){ fail++; }
+    btn.textContent = `删除中 ${i+1}/${names.length}`;
+  }
+  selected.clear();
+  btn.disabled = false;
+  btn.textContent = '确认删除';
+  closeModalBatch();
+  if(viewMode === 'pie') drawPie(); else render();
+  toast(`完成：成功 ${ok}，失败 ${fail}`, fail ? 'err' : 'ok');
+}
+
+function closeModalBatch(){ $('modalBatch').classList.add('hide'); }
 
 load();
 </script>
